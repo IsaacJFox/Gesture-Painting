@@ -1,3 +1,6 @@
+# Gesture-Painting
+For our class CSCI-4250 Human Computer Interaction we were tasked to create something that would be interacted with beyond the basic mouse and keyboard controls. We chose to do gesture controls to interface with painting.
+
 # Gesture Painting — Hand Tracking Demo
 
 This demo uses a webcam to detect hands and track finger movements.
