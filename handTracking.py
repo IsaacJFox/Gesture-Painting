@@ -1,9 +1,4 @@
-class HandTracking:
-    def __init__(self):
-        pass
-    def detectHand(self):
-        pass
-    def trackFingers(self):
-        pass
-    def getFingerPostion(self):
-        pass
+"""Compatibility import for the existing project module name."""
+from hand_tracking import HandTracking
+
+__all__ = ['HandTracking']
