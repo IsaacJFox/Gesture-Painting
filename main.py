@@ -4,9 +4,9 @@ import math
 import time
 from collections import deque
 import cv2
-from hand_tracking import HandTracking
 from gestures import GestureRecognition, ClearHold
 from drawing import Drawing
+from voice_commands import VoiceListener, ToolControl, parse_command
 
 WIDTH, HEIGHT = 1280, 720
 TOP, BOTTOM = 85, 670
@@ -49,7 +49,7 @@ def draw_trail(display, trail, color, thickness):
 
 
 class GesturePainting:
-    def __init__(self, camera_index=0):
+    def __init__(self, camera_index=0, voice=False, microphone_index=None, language='en-US'):
         self.camera_index = camera_index
         self.board = Drawing(WIDTH, HEIGHT)
         # pause_votes: frames needed to end a stroke (higher = fewer accidental
@@ -74,6 +74,11 @@ class GesturePainting:
         self.times = [0.0, 0.0, 0.0]  # ms: camera wait, tracking, drawing
         self.smoothing = DEFAULT_SMOOTHING
         self.cursor_position = None
+        self.control = ToolControl()
+        self.voice = VoiceListener(microphone_index, language)
+        self.voice_at_start = voice
+        self.voice_status = 'OFF - V to enable (online speech)'
+        self.last_heard = ''
         self.apply_smoothing()
 
     def apply_smoothing(self):
@@ -85,10 +90,60 @@ class GesturePainting:
     def notify(self, message):
         self.message, self.message_until = message, time.monotonic() + 3
 
+    def toggle_voice(self):
+        if self.voice.enabled:
+            self.voice.stop()
+            self.control.cancel()
+            self.voice_status = 'OFF - V to enable'
+            self.notify('Microphone off. G restores gesture tool selection.')
+        elif self.voice.start():
+            self.voice_status = 'Starting microphone'
+            self.notify('Voice on: speech is sent to Google; V turns it off')
+        else:
+            self.notify('Microphone is stopping - wait a moment, then press V')
+
+    def reset_stroke(self):
+        self.board.stop()
+        self.raw_trail.clear()
+        self.pen_trail.clear()
+
+    def handle_voice(self, now):
+        if self.control.expire(now):
+            self.notify('Clear cancelled: confirmation timed out')
+        for event in self.voice.poll():
+            if event.kind == 'status':
+                self.voice_status = event.text
+            elif event.kind == 'error':
+                self.voice_status = 'ERROR - see terminal; V to retry'
+                self.control.cancel()
+                print(event.text)
+                self.notify(event.text[:95])
+            elif event.kind == 'notice':
+                self.notify(event.text)
+            elif event.kind == 'text':
+                # Never apply responses that have been sitting in a stalled UI.
+                if now - event.completed_at > 5 or now - event.captured_at > 15:
+                    self.notify('Voice response expired - repeat the command')
+                    continue
+                self.last_heard = event.text
+                command = parse_command(event.text)
+                if command is None:
+                    self.notify('Command not recognized - see README voice commands')
+                    continue
+                self.reset_stroke()
+                message, clear = self.control.apply(command, now, event.captured_at)
+                if command.action == 'color':
+                    self.color_index = next(i for i, (name, _) in enumerate(COLORS)
+                                            if name.lower() == command.value)
+                    self.board.color = COLORS[self.color_index][1]
+                if clear:
+                    self.board.clearCanvas()
+                self.notify(message)
+
     def start_webcam(self):
         self.camera = cv2.VideoCapture(self.camera_index)
         if not self.camera.isOpened():
-            raise RuntimeError('Cannot open webcam. Allow camera access or try --camera 1.')
+            raise RuntimeError('Cannot open webcam. Allow camera access or try --camera 0 / --camera 1.')
         # MJPG lets most webcams reach 30 fps at 720p. The default format is
         # often slower, and some cameras drop their frame rate in dim light,
         # which makes strokes look jerky.
@@ -97,6 +152,7 @@ class GesturePainting:
         self.camera.set(cv2.CAP_PROP_FRAME_HEIGHT, HEIGHT)
         self.camera.set(cv2.CAP_PROP_FPS, 30)
         self.camera.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        from hand_tracking import HandTracking
         self.tracker = HandTracking(max_hands=2)
 
     def select_color(self, point, mode, now):
@@ -105,6 +161,7 @@ class GesturePainting:
         if target != self.hover_target:
             self.hover_target, self.hover_since, self.hover_fired = target, now, False
         if target is not None and now - self.hover_since >= 0.7 and not self.hover_fired:
+            self.board.stop()
             self.color_index = int(target)
             self.board.color = COLORS[self.color_index][1]
             self.hover_fired = True
@@ -113,6 +170,8 @@ class GesturePainting:
     def run(self):
         try:
             self.start_webcam()
+            if self.voice_at_start:
+                self.toggle_voice()
             while True:
                 t0 = time.perf_counter()
                 ok, frame = self.camera.read()
@@ -122,16 +181,19 @@ class GesturePainting:
                 t1 = time.perf_counter()
                 _, hands = self.tracker.trackFingers(frame, draw=False)
                 t2 = time.perf_counter()
-                mode = self.recognizer.recognizeGestures(hands)
+                gesture = self.recognizer.recognizeGestures(hands)
                 now = time.monotonic()
+                self.handle_voice(now)
+                mode = self.control.resolve(gesture, hand_present=bool(hands))
                 self.fps = 0.9 * self.fps + 0.1 / max(now - self.last_frame, 1e-6)
                 self.last_frame = now
                 clear, progress = self.clear_hold.update(mode == 'clear', now)
                 if clear:
                     self.board.clearCanvas()
+                    self.control.cancel()
                     self.notify('Board cleared - lower hands to continue')
                 # The pen follows the same hand that decided the gesture.
-                primary = self.recognizer.primary
+                primary = self.recognizer.primary if hands else None
                 point = None
                 if primary is not None:
                     p = primary.landmark
@@ -144,7 +206,9 @@ class GesturePainting:
                     # without whole-pixel rounding.
                     point = (max(0.0, min(WIDTH - 1.0, x * WIDTH)),
                              max(0.0, min(HEIGHT - 1.0, y * HEIGHT)))
-                    self.select_color((int(point[0]), int(point[1])), mode, now)
+                    # Pointing can select pen colors even while highlight is selected.
+                    self.select_color((int(point[0]), int(point[1])),
+                                      gesture if not self.control.pending_clear else 'pause', now)
                 else:
                     self.hover_target = None
                 if point and TOP + 50 <= point[1] < BOTTOM - 50 and mode in ('draw', 'highlight', 'erase'):
@@ -161,8 +225,9 @@ class GesturePainting:
                 cv2.rectangle(display, (0, 0), (WIDTH, TOP), (32, 32, 32), -1)
                 cv2.rectangle(display, (0, BOTTOM), (WIDTH, HEIGHT), (32, 32, 32), -1)
                 shapes = 'ON' if self.board.auto_shapes else 'OFF'
-                label = f'Gesture Painting | {mode.upper()} | Auto-shapes: {shapes} | {self.fps:.0f} fps'
-                cv2.putText(display, label, (15, 30), 0, 0.7, (255, 255, 255), 2)
+                tool_label = self.control.tool.upper() if self.control.tool else 'GESTURES'
+                label = f'{mode.upper()} | Tool: {tool_label} | Shapes: {shapes} | {self.fps:.0f} fps'
+                cv2.putText(display, label, (15, 30), 0, 0.55, (255, 255, 255), 2)
                 cv2.putText(display, f'Brush: {self.board.brush_size} | {COLORS[self.color_index][0]} | Smoothing {self.smoothing}/{len(SMOOTHING_LEVELS) - 1}',
                             (15, 60), 0, 0.5, (200, 200, 200), 1)
                 for i, (name, color) in enumerate(COLORS):
@@ -172,6 +237,14 @@ class GesturePainting:
                 # Small live preview helps position hands even on a black board.
                 preview = cv2.resize(frame, (240, 135))
                 display[TOP:TOP+135, WIDTH-240:WIDTH] = preview
+                # Persistent feedback for microphone state and heard commands.
+                display = cv2.copyMakeBorder(display, 0, 65, 0, 0,
+                                             cv2.BORDER_CONSTANT, value=(32, 32, 32))
+                cv2.putText(display, 'Voice: ' + self.voice_status[:110],
+                            (15, 745), 0, 0.46, (160, 230, 255), 1)
+                heard = self.last_heard.encode('ascii', 'replace').decode('ascii')[:100]
+                cv2.putText(display, 'Heard: ' + (heard or '-'),
+                            (15, 770), 0, 0.46, (210, 210, 210), 1)
                 if point:
                     if self.board.previous is not None:
                         # Show the actual smoothed brush/eraser position, not
@@ -205,9 +278,18 @@ class GesturePainting:
                     cv2.putText(display, f'Hold BOTH palms to clear: {progress:.0%}',
                                 (300, 120), 0, 0.7, (0, 220, 255), 2)
                     cv2.rectangle(display, (300, 130), (300+int(500*progress), 140), (0, 220, 255), -1)
-                cv2.putText(display, 'Index: draw | 2 fingers: highlight | Palm: wipe | Both palms 2s: clear',
+                if self.control.pending_clear:
+                    remaining = max(0, self.control.clear_deadline - now)
+                    cv2.rectangle(display, (200, 280), (1080, 370), (30, 30, 30), -1)
+                    cv2.putText(display, f'Clear board? Say "confirm clear" or "cancel" ({remaining:.0f}s)',
+                                (220, 320), 0, 0.65, (0, 220, 255), 2)
+                    cv2.putText(display, 'Drawing paused | Esc cancels', (220, 352), 0, 0.55, (230, 230, 230), 1)
+                help_text = ('Point/2 fingers: selected tool | Fist: pause | Palm: wipe | G: gesture tools'
+                             if self.control.tool else
+                             'Index: draw | 2 fingers: highlight | Palm: wipe | Both palms 2s: clear')
+                cv2.putText(display, help_text,
                             (15, 692), 0, 0.53, (230, 230, 230), 1)
-                cv2.putText(display, 'B: camera | S: save | 1-4: color | +/-: brush | [ ]: smooth | T: shapes | D: debug | Q: quit',
+                cv2.putText(display, 'V: voice on/off | G: gestures | B: camera | S: save | 1-4: color | +/-: size | [ ]: smooth | T: shapes | D: debug | Q: quit',
                             (15, 713), 0, 0.48, (180, 180, 180), 1)
                 if now < self.message_until:
                     cv2.putText(display, self.message, (20, 640), 0, 0.65, (0, 220, 255), 2)
@@ -216,9 +298,19 @@ class GesturePainting:
                 sample = ((t1 - t0) * 1000, (t2 - t1) * 1000, (t3 - t2) * 1000)
                 self.times = [0.9 * old + 0.1 * new for old, new in zip(self.times, sample)]
                 key = cv2.waitKey(1) & 0xFF
+                if key == 27 and self.control.pending_clear:
+                    self.control.cancel()
+                    self.notify('Clear cancelled')
+                    continue
                 if key in (ord('q'), 27):
                     break
-                if key == ord('d'):
+                if key == ord('v'):
+                    self.toggle_voice()
+                elif key == ord('g'):
+                    self.reset_stroke()
+                    self.control.apply(parse_command('gesture mode'), now)
+                    self.notify('Gesture tool selection restored')
+                elif key == ord('d'):
                     self.debug = not self.debug
                 elif key == ord('t'):
                     # Finish the current stroke before switching modes.
@@ -248,6 +340,7 @@ class GesturePainting:
             self.close_program()
 
     def close_program(self):
+        self.voice.stop()
         if self.tracker:
             self.tracker.close()
         if self.camera:
@@ -258,6 +351,9 @@ class GesturePainting:
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--camera', type=int, default=1)
+    parser.add_argument('--voice', action='store_true', help='Enable online microphone commands at startup')
+    parser.add_argument('--microphone', type=int, default=None, help='Microphone device index')
+    parser.add_argument('--language', default='en-US', help='Speech dialect, e.g. en-US or en-IN')
     args = parser.parse_args()
-    GesturePainting(args.camera).run()
+    GesturePainting(args.camera, args.voice, args.microphone, args.language).run()
 
